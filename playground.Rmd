@@ -76,6 +76,12 @@ corr = cor(clean_data, use = "pairwise.complete.obs")
 clean_data = clean_data[ , !names(clean_data) %in% "URXUCR.y"]
 ```
 
+## Saving cleaned dataset
+
+```{r}
+write.csv(clean_data, "./data/clean_data.csv", row.names = FALSE, fileEncoding = "UTF-8")
+```
+
 ##  Simple linear model (modeling )
 
 ```{r}
