@@ -17,13 +17,17 @@ library(dplyr)
 ## Read datasets
 
 ```{r}
-demo_data = read_xpt("DEMO_L.xpt")
-rhq_data = read_xpt("RHQ_L.xpt")
-tst_data = read_xpt("TST_L.xpt")
+demo_data = read_xpt("./data/DEMO_H.xpt")
+rhq_data = read_xpt("./data/RHQ_H.xpt")
+tst_data = read_xpt("./data/TST_H.xpt")
+ssphte_data = read_xpt("./data/SSPHTE_H.xpt")
+ephpp_data = read_xpt("./data/EPHPP_H.xpt")
 
 nrow(demo_data)
 nrow(rhq_data)
 nrow(tst_data)
+nrow(ssphte_data)
+nrow(ephpp_data)
 
 ```
 
@@ -32,6 +36,8 @@ nrow(tst_data)
 ```{r}
 merged_data = inner_join(demo_data, rhq_data, by = "SEQN")
 merged_data = inner_join(merged_data, tst_data, by = "SEQN")
+merged_data = inner_join(merged_data, ssphte_data, by = "SEQN")
+merged_data = inner_join(merged_data, ephpp_data, by = "SEQN")
 
 nrow(merged_data)
 unique(merged_data$RIAGENDR)
@@ -48,7 +54,7 @@ print(labels_df)
 
 ```{r}
 colSums(is.na(merged_data))
-clean_data <- merged_data[, colSums(is.na(merged_data)) <= 2850]
+clean_data <- merged_data[, colSums(is.na(merged_data)) <= 500]
 
 var_labels <- sapply(clean_data, function(x) attr(x, "label"))
 labels_df <- data.frame(
@@ -58,7 +64,7 @@ labels_df <- data.frame(
 print(labels_df)
 ```
 
-##  Simple linear model (modeling )
+## Simple linear model (modeling )
 
 ```{r}
 full_lm = lm(RHD167 ~ . -SEQN, data=clean_data, na.action = na.omit)
