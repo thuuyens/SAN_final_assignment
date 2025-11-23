@@ -12,6 +12,7 @@ knitr::opts_chunk$set(echo = TRUE)
 library(knitr)
 library(haven)
 library(dplyr)
+library(car)
 ```
 
 ## Read datasets
@@ -62,12 +63,24 @@ labels_df <- data.frame(
   label = unname(var_labels)
 )
 print(labels_df)
+nrow(clean_data)
 ```
 
-## Simple linear model (modeling )
+## Remove constant and correlated columns
 
 ```{r}
-full_lm = lm(RHD167 ~ . -SEQN, data=clean_data, na.action = na.omit)
+
+clean_data = clean_data[,sapply(clean_data, function(x) length(unique(na.omit(x))) > 1)]
+
+corr = cor(clean_data, use = "pairwise.complete.obs")
+clean_data = clean_data[ , !names(clean_data) %in% "URXUCR.y"]
+```
+
+##  Simple linear model (modeling )
+
+```{r}
+full_lm = lm(LBXTST ~ . -SEQN, data=clean_data, na.action = na.omit)
 summary(full_lm)
 plot((full_lm))
+vif(full_lm)
 ```
