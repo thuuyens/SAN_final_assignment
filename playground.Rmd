@@ -1,0 +1,67 @@
+---
+title: "playground"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+library(knitr)
+library(haven)
+library(dplyr)
+```
+
+## Read datasets
+
+```{r}
+demo_data = read_xpt("DEMO_L.xpt")
+rhq_data = read_xpt("RHQ_L.xpt")
+tst_data = read_xpt("TST_L.xpt")
+
+nrow(demo_data)
+nrow(rhq_data)
+nrow(tst_data)
+
+```
+
+## Merging datasets (keeping only rows existing in all datasets)
+
+```{r}
+merged_data = inner_join(demo_data, rhq_data, by = "SEQN")
+merged_data = inner_join(merged_data, tst_data, by = "SEQN")
+
+nrow(merged_data)
+unique(merged_data$RIAGENDR)
+
+var_labels <- sapply(merged_data, function(x) attr(x, "label"))
+labels_df <- data.frame(
+  variable = names(var_labels),
+  label = unname(var_labels)
+)
+print(labels_df)
+```
+
+## Removing columns with NA
+
+```{r}
+colSums(is.na(merged_data))
+clean_data <- merged_data[, colSums(is.na(merged_data)) <= 2850]
+
+var_labels <- sapply(clean_data, function(x) attr(x, "label"))
+labels_df <- data.frame(
+  variable = names(var_labels),
+  label = unname(var_labels)
+)
+print(labels_df)
+```
+
+##  Simple linear model (modeling )
+
+```{r}
+full_lm = lm(RHD167 ~ . -SEQN, data=clean_data, na.action = na.omit)
+summary(full_lm)
+plot((full_lm))
+```
