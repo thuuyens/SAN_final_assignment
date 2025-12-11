@@ -1,0 +1,92 @@
+---
+title: "playground"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+library(knitr)
+library(haven)
+library(dplyr)
+library(car)
+```
+
+## Read datasets
+
+```{r}
+demo_data = read_xpt("./data/DEMO_H.xpt")
+rhq_data = read_xpt("./data/RHQ_H.xpt")
+tst_data = read_xpt("./data/TST_H.xpt")
+ssphte_data = read_xpt("./data/SSPHTE_H.xpt")
+ephpp_data = read_xpt("./data/EPHPP_H.xpt")
+
+nrow(demo_data)
+nrow(rhq_data)
+nrow(tst_data)
+nrow(ssphte_data)
+nrow(ephpp_data)
+
+```
+
+## Merging datasets (keeping only rows existing in all datasets)
+
+```{r}
+merged_data = inner_join(demo_data, rhq_data, by = "SEQN")
+merged_data = inner_join(merged_data, tst_data, by = "SEQN")
+merged_data = inner_join(merged_data, ssphte_data, by = "SEQN")
+merged_data = inner_join(merged_data, ephpp_data, by = "SEQN")
+
+nrow(merged_data)
+unique(merged_data$RIAGENDR)
+
+var_labels <- sapply(merged_data, function(x) attr(x, "label"))
+labels_df <- data.frame(
+  variable = names(var_labels),
+  label = unname(var_labels)
+)
+print(labels_df)
+```
+
+## Removing columns with NA
+
+```{r}
+colSums(is.na(merged_data))
+clean_data <- merged_data[, colSums(is.na(merged_data)) <= 500]
+
+var_labels <- sapply(clean_data, function(x) attr(x, "label"))
+labels_df <- data.frame(
+  variable = names(var_labels),
+  label = unname(var_labels)
+)
+print(labels_df)
+nrow(clean_data)
+```
+
+## Remove constant and correlated columns
+
+```{r}
+
+clean_data = clean_data[,sapply(clean_data, function(x) length(unique(na.omit(x))) > 1)]
+
+corr = cor(clean_data, use = "pairwise.complete.obs")
+clean_data = clean_data[ , !names(clean_data) %in% "URXUCR.y"]
+```
+
+## Saving cleaned dataset
+
+```{r}
+write.csv(clean_data, "./data/clean_data.csv", row.names = FALSE, fileEncoding = "UTF-8")
+```
+
+##  Simple linear model (modeling )
+
+```{r}
+full_lm = lm(LBXTST ~ . -SEQN, data=clean_data, na.action = na.omit)
+summary(full_lm)
+plot((full_lm))
+vif(full_lm)
+```

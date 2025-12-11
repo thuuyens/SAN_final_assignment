@@ -1,0 +1,236 @@
+---
+title: "playground"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+library(knitr)
+library(haven)
+library(dplyr)
+library(car)
+library(survey)
+library(srvyr)
+```
+
+## Read datasets
+
+```{r}
+#Nacist data a z nekterych vybrat jen nektere promenne
+
+#Demographics, RIDAGEYR - vek, RIDEXPRG - pregnant, DMDEDUC2 - education level, RIAGENDR - gender, INDFMPIR - ratio of family income to poverty 
+#RIDSTATR - both interview and MEC examination (2 - both, 1 - only interview)
+demo_data = read_xpt("./data/DEMO_H.xpt") |> select(SEQN,RIDAGEYR,RIDEXPRG,DMDEDUC2,RIAGENDR,INDFMPIR,WTMEC2YR, SDMVPSU,SDMVSTRA)
+#Reproductive health data, RHQ031 - had regular periods in past 12 months, RHQ074 - tried for a yer to become pregnant, RHQ076 - seen DR unable to become pregnant, RHQ131 - ever been pregnant, 
+#RHQ160 - how many times have been pregnant, RHQ171 - live birth deliveries, RHD280 - had a hysterectomy, RHQ078 - pelvic infection,RHD180 - age at firts livebirth
+rhq_data = read_xpt("./data/RHQ_H.xpt") |> select(SEQN,RHQ031,RHQ074,RHQ076, RHQ131,RHQ160, RHQ171, RHD280, RHQ078, RHD180)
+# SEx steroide hormone, LBXTST - testosterone (ng/dL), LBXEXT - estradiol(pg/mL), LBXSHGB (nmol/L), promene koncici na LC (0 - above detection limit, 1 below detection limit)
+tst_data = read_xpt("./data/TST_H.xpt")
+#Phtalates and plasticizesr metabolites
+ssphte_data = read_xpt("./data/SSPHTE_H.xpt")
+
+#Personal care and consumer product chemicals and metabolites
+ephpp_data = read_xpt("./data/EPHPP_H.xpt")
+
+#phtalates and plasticizers metabolites
+phthte_data = read_xpt("./data/PHTHTE_H.xpt")
+
+#alcohol use, ALQ120Q - How often drink alcohol over past 12 months
+alq_data = read_xpt("./data/ALQ_H.xpt") |> select(SEQN,ALQ120Q)
+#smoking cigarette use, SMQ040 - do you now smoke cigarettes, SMD650 avg cigarettes a day last month
+smq_data = read_xpt("./data/SMQ_H.xpt") |> select(SEQN,SMQ040,SMD650)
+#medical condition
+#mcq_data = read_xpt("./data/MCQ_H.xpt") |> select(SEQN,)
+#body measures, BMXBMI - body maxx index
+bmx_data = read_xpt("./data/BMX_H.xpt") |> select(SEQN,BMXBMI)
+
+
+```
+
+## Merging datasets
+
+```{r}
+#iiner join keep only rows where there is a SEQN match in both datasets
+merged_data = inner_join(demo_data, rhq_data, by = "SEQN")
+merged_data = inner_join(merged_data, tst_data, by = "SEQN")
+merged_data = inner_join(merged_data, ssphte_data, by = "SEQN")
+merged_data = inner_join(merged_data, ephpp_data, by = "SEQN")
+merged_data = inner_join(merged_data, alq_data, by = "SEQN")
+merged_data = inner_join(merged_data, smq_data, by = "SEQN")
+merged_data = inner_join(merged_data, bmx_data, by = "SEQN")
+merged_data = inner_join(merged_data, phthte_data, by = "SEQN")
+nrow(merged_data)
+#jedna promena se vyskytuje ve vice datasetech
+merged_data <- merged_data[, !grepl("\\.y$", names(merged_data))]
+names(merged_data)[names(merged_data) == "URXUCR.x"] <- "URXUCR"
+names(merged_data)[names(merged_data) == "WTSB2YR.x"] <- "WTSB2YR"
+
+var_labels <- sapply(merged_data, function(x) attr(x, "label"))
+labels_df <- data.frame(
+  variable = names(var_labels),
+  label = unname(var_labels)
+)
+print(labels_df)
+```
+
+## Remove, based on exclusion, inclusion criteria from the plan
+
+```{r}
+#age between 18 and 45 and female only, not pregnant
+clean_data <- merged_data[merged_data$RIDAGEYR >= 18 & merged_data$RIDAGEYR <= 50 & merged_data$RIAGENDR == 2 & merged_data$RIDEXPRG == 2,]
+nrow(clean_data)
+#extreme urinary creatine values
+
+clean_data <- clean_data[clean_data$URXUCR<300,]
+
+#missing key covariates -> R si NaN values odstraní automaticky pri vytvareni modelu ?
+
+#urinary chemicals measurement and MEC examination
+clean_data <- clean_data[clean_data$WTSSBH2Y>0 & clean_data$WTSB2YR>0 & clean_data$WTMEC2YR>0,]
+nrow(clean_data)
+
+#at least one detectable urinary chemical measurement (ze vsech chemikalii v EPHPP a SSPHTE)
+all_vars <- union(union(names(ssphte_data), names(ephpp_data)),names(phthte_data))
+exclude_vars <- c( "SEQN","WTSSBH2Y","WTSB2YR" )
+edc_vars <- setdiff(all_vars, exclude_vars)
+length(edc_vars)
+data_1 <- clean_data[
+  rowSums(!is.na(clean_data[, edc_vars])) >= 1, #alespon jedna hodnota ze vsech merenych chemikalii neni Nan (missing)
+]
+# at least one detectable hormone measurement (not missing - nan)
+horm_vars <- c("LBXSHBG","LBXEST","LBXTST")
+data_1 <- data_1[
+  rowSums(!is.na(data_1[, horm_vars])) >= 1, #alespon jedna hodnota ze vsech hormonu neni nan
+]
+
+nrow(data_1)
+```
+
+## Survey design object -> to work with the weights
+NHANES: You must use the weight of the smallest subpopulation that includes all the variables you want to include in your analysis.
+Z tech mensich souboru obsahují speciální vahy jenom ty chemikálie (EPHPP a SSPHTE a PHTHTE). EPHPP a PHTHTE maji stejne (WTSB2YR) a SSPHTE ma jiné (WTSSBH2Y). Nevim ktera z nich by se mela pouzit, ale nejmensi je dataset SSPHTE.
+
+```{r}
+# v ukazkach pak na vsechny upravy pouzivaji uz jenom survey desing objekt -> vytvorit z celych dat a znovu stejne profiltrovat
+data_w <- svydesign(id = ~SDMVPSU, strata= ~SDMVSTRA, weight=~WTSB2YR,   nest=TRUE, data=merged_data)
+
+obj_cleaned <- data_w |>
+  subset(
+    RIDAGEYR >= 18 &
+    RIDAGEYR <= 50 &
+    RIAGENDR == 2 &
+    RIDEXPRG == 2 &
+    URXUCR < 300 &
+    WTSSBH2Y > 0 &
+    WTSB2YR > 0 &
+    WTMEC2YR > 0 &
+    rowSums(!is.na(as.data.frame(data_w$variables[, edc_vars]))) >= 1 &
+    rowSums(!is.na(as.data.frame(data_w$variables[, horm_vars]))) >= 1
+  )
+nrow(obj_cleaned$variables)
+summary(obj_cleaned)
+#vytvoreny survey objekt porad obsahuje sloupce s vahama z vetsich datasetu -> pri vytvareni modelu upravit a nebrat je v uvahu
+```
+
+##  Variables statistics
+
+```{r}
+#age
+svymean(~RIDAGEYR,obj_cleaned,na.rm = TRUE)
+
+
+```
+```{r}
+ #visualize
+svyhist(~URXBPH, design=obj_cleaned, main="Bisphenol A concentration")
+
+svyhist(~log(URXBPH + 1), design=obj_cleaned, main="Bisphenol A concentration, log transformed")
+```
+```{r}
+#Correlation matrix - na vsem krome chemikalii, weights a gender a pregnant, protoze to jsou po filtraci vlastne konstantni sloupce pro vsechny stejne
+exclude_vars <- c("SEQN","WTMEC2YR", "WTSSBH2Y", "WTSB2YR",edc_vars,"SDMVPSU","SDMVSTRA","RIDEXPRG","RIAGENDR")
+cor_vars <- setdiff(names(obj_cleaned$variables), exclude_vars)
+length(cor_vars)
+
+cor_matrix <- cor(obj_cleaned$variables[, cor_vars],use = "pairwise.complete.obs")
+corrplot::corrplot(cor_matrix,tl.cex = 0.6,method = "color",type = "upper")
+
+
+```
+
+```{r}
+#V clanku: Use PCA to deal with collinearity of chemicals -> get fewer independent components. Factors with eigen values higher than 1 were determined as the main components
+#pridat dalsi sloupce do datasetu s logtransformovanymi chemikaliemi, edc_vars obsahuje jmena sloupcu vsech chemikalii v datasetu
+obj_cleaned$variables[, paste0("log_", edc_vars)] <-log(obj_cleaned$variables[, edc_vars] + 1)
+log_edc_vars <- paste0("log_", edc_vars) #log_edc_vars -> jmena vsech log transformovanych chemikalii
+
+
+#potreba odstranit tuto chemikalii, jinak error: cannot rescale constant/zero column to unit variance, je to comment code (value 0 - at or above detection limit)
+del <- c( "log_URDMEPLC" )
+log_edc_vars <- setdiff(log_edc_vars,del)
+
+
+pca_w <- svyprcomp(
+  ~ as.matrix(obj_cleaned$variables[, log_edc_vars]),
+  design = obj_cleaned,
+  center = TRUE,
+  scale  = TRUE
+)
+
+summary(pca_w)
+
+
+```
+
+
+```{r}
+
+eigenvalues <- pca_w$sdev^2
+prop_var    <- eigenvalues / sum(eigenvalues)
+cum_var     <- cumsum(prop_var)
+
+pca_table <- data.frame(
+  PC = paste0("PC", seq_along(eigenvalues)),
+  Eigenvalue = eigenvalues,
+    Proportion_of_variance = prop_var,
+  Cumulative_variance = cum_var
+)
+
+pca_table
+
+```
+
+
+```{r}
+
+
+
+```
+
+
+```{r}
+
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+
+```
+
+
+
+```{r}
+
+
+```
