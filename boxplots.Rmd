@@ -1,0 +1,730 @@
+---
+title: "SAN chemicals"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+library(knitr)
+library(haven)
+library(dplyr)
+library(car)
+library(survey)
+library(srvyr)
+library(ggplot2)
+library(tidyr)
+```
+
+## Read datasets
+
+```{r}
+#Nacist data a z nekterych vybrat jen nektere promenne
+
+#Demographics, RIDAGEYR - vek, RIDEXPRG - pregnant, DMDEDUC2 - education level, RIAGENDR - gender, INDFMPIR - ratio of family income to poverty 
+#RIDSTATR - both interview and MEC examination (2 - both, 1 - only interview)
+demo_data = read_xpt("./data/DEMO_H.xpt") |> select(SEQN,RIDAGEYR,RIDEXPRG,DMDEDUC2,RIAGENDR,INDFMPIR,WTMEC2YR, SDMVPSU,SDMVSTRA)
+#Reproductive health data, RHQ031 - had regular periods in past 12 months, RHQ074 - tried for a yer to become pregnant, RHQ076 - seen DR unable to become pregnant, RHQ131 - ever been pregnant, 
+#RHQ160 - how many times have been pregnant, RHQ171 - live birth deliveries, RHD280 - had a hysterectomy, RHQ078 - pelvic infection,RHD180 - age at firts livebirth
+rhq_data = read_xpt("./data/RHQ_H.xpt") |> select(SEQN,RHQ031,RHQ074,RHQ076, RHQ131,RHQ160, RHQ171, RHD280, RHQ078, RHD180)
+# SEx steroide hormone, LBXTST - testosterone (ng/dL), LBXEXT - estradiol(pg/mL), LBXSHGB (nmol/L), promene koncici na LC (0 - above detection limit, 1 below detection limit)
+tst_data = read_xpt("./data/TST_H.xpt")
+#Phtalates and plasticizesr metabolites
+ssphte_data = read_xpt("./data/SSPHTE_H.xpt")
+
+#Personal care and consumer product chemicals and metabolites
+ephpp_data = read_xpt("./data/EPHPP_H.xpt")
+
+#phtalates and plasticizers metabolites
+phthte_data = read_xpt("./data/PHTHTE_H.xpt")
+
+#alcohol use, ALQ120Q - How often drink alcohol over past 12 months
+alq_data = read_xpt("./data/ALQ_H.xpt") |> select(SEQN,ALQ120Q)
+#smoking cigarette use, SMQ040 - do you now smoke cigarettes, SMD650 avg cigarettes a day last month
+smq_data = read_xpt("./data/SMQ_H.xpt") |> select(SEQN,SMQ040,SMD650)
+#medical condition
+#mcq_data = read_xpt("./data/MCQ_H.xpt") |> select(SEQN,)
+#body measures, BMXBMI - body maxx index
+bmx_data = read_xpt("./data/BMX_H.xpt") |> select(SEQN,BMXBMI)
+
+
+```
+
+## Merging datasets
+
+```{r}
+#iiner join keep only rows where there is a SEQN match in both datasets
+merged_data = inner_join(demo_data, rhq_data, by = "SEQN")
+merged_data = inner_join(merged_data, tst_data, by = "SEQN")
+merged_data = inner_join(merged_data, ssphte_data, by = "SEQN")
+merged_data = inner_join(merged_data, ephpp_data, by = "SEQN")
+merged_data = inner_join(merged_data, alq_data, by = "SEQN")
+merged_data = inner_join(merged_data, smq_data, by = "SEQN")
+merged_data = inner_join(merged_data, bmx_data, by = "SEQN")
+merged_data = inner_join(merged_data, phthte_data, by = "SEQN")
+nrow(merged_data)
+#jedna promena se vyskytuje ve vice datasetech
+merged_data <- merged_data[, !grepl("\\.y$", names(merged_data))]
+names(merged_data)[names(merged_data) == "URXUCR.x"] <- "URXUCR"
+names(merged_data)[names(merged_data) == "WTSB2YR.x"] <- "WTSB2YR"
+
+var_labels <- sapply(merged_data, function(x) attr(x, "label"))
+labels_df <- data.frame(
+  variable = names(var_labels),
+  label = unname(var_labels)
+)
+print(labels_df)
+```
+
+## Remove, based on exclusion, inclusion criteria from the plan
+
+```{r}
+#age between 18 and 50 and female only, not pregnant
+clean_data <- merged_data[merged_data$RIDAGEYR >= 18 & merged_data$RIDAGEYR <= 50 & merged_data$RIAGENDR == 2 & merged_data$RIDEXPRG == 2,]
+nrow(clean_data)
+#extreme urinary creatine values
+
+clean_data <- clean_data[clean_data$URXUCR<300,]
+
+#missing key covariates -> R si NaN values odstraní automaticky pri vytvareni modelu ?
+
+#urinary chemicals measurement and MEC examination
+clean_data <- clean_data[clean_data$WTSSBH2Y>0 & clean_data$WTSB2YR>0 & clean_data$WTMEC2YR>0,]
+nrow(clean_data)
+
+#at least one detectable urinary chemical measurement (ze vsech chemikalii v EPHPP a SSPHTE)
+all_vars <- union(union(names(ssphte_data), names(ephpp_data)),names(phthte_data))
+exclude_vars <- c( "SEQN","WTSSBH2Y","WTSB2YR" )
+edc_vars <- setdiff(all_vars, exclude_vars)
+length(edc_vars)
+data_1 <- clean_data[
+  rowSums(!is.na(clean_data[, edc_vars])) >= 1, #alespon jedna hodnota ze vsech merenych chemikalii neni Nan (missing)
+]
+# at least one detectable hormone measurement (not missing - nan)
+horm_vars <- c("LBXSHBG","LBXEST","LBXTST")
+data_1 <- data_1[
+  rowSums(!is.na(data_1[, horm_vars])) >= 1, #alespon jedna hodnota ze vsech hormonu neni nan
+]
+
+nrow(data_1)
+```
+
+## Survey design object -> to work with the weights
+zdroj:https://wwwn.cdc.gov/nchs/nhanes/tutorials/weighting.aspx
+Weights are created in NHANES to account for the complex survey design (including oversamplig), survey non-response and post-stratification adjustment to match total population counts in the USA. A sample weight is assigned to each sample person. It is a measure of the number of people in the population represented by that sample person.
+NHANES: You must use the weight of the smallest subpopulation that includes all the variables you want to include in your analysis.
+Z tech mensich souboru obsahují speciální vahy jenom ty chemikálie (EPHPP a SSPHTE a PHTHTE). EPHPP a PHTHTE maji stejne (WTSB2YR) a SSPHTE ma jiné (WTSSBH2Y). Nevim ktera z nich by se mela pouzit, ale nejmensi je dataset SSPHTE.
+v ukazkach pak na vsechny upravy pouzivaji uz jenom survey desing objekt na práci s weighted NHANES dataset -> vytvorit z celych dat a znovu stejne profiltrovat
+
+```{r}
+
+data_w <- svydesign(id = ~SDMVPSU, strata= ~SDMVSTRA, weight=~WTSB2YR,   nest=TRUE, data=merged_data)
+
+obj_cleaned <- data_w |>
+  subset(
+    RIDAGEYR >= 18 &
+    RIDAGEYR <= 50 &
+    RIAGENDR == 2 &
+    RIDEXPRG == 2 &
+    URXUCR < 300 &
+    WTSSBH2Y > 0 &
+    WTSB2YR > 0 &
+    WTMEC2YR > 0 &
+    rowSums(!is.na(as.data.frame(data_w$variables[, edc_vars]))) >= 1 &
+    rowSums(!is.na(as.data.frame(data_w$variables[, horm_vars]))) >= 1
+  )
+nrow(obj_cleaned$variables)
+summary(obj_cleaned)
+#vytvoreny survey objekt porad obsahuje sloupce s vahama z vetsich datasetu -> pri vytvareni modelu upravit a nebrat je v uvahu
+```
+
+##  Variables statistics
+
+```{r}
+#age
+svymean(~RIDAGEYR,obj_cleaned,na.rm = TRUE)
+
+
+```
+```{r}
+ #visualize
+par(mfrow = c(2, 2))
+svyhist(~URXBPH, design=obj_cleaned, main="Bisphenol A concentration",xlab="Bisphenol A")
+svyhist(~URXTRS, design=obj_cleaned, main="Triclosan concentration",xlab="Triclosan")
+svyhist(~URXMHH, design=obj_cleaned, main="MEHP concentration",xlab="MEHP")
+svyhist(~URXMPB, design=obj_cleaned, main="MPB concentration",xlab="MPB")
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+par(mfrow = c(2, 2))
+svyhist(~log(URXBPH + 1), design=obj_cleaned, main="Bisphenol A concentration, log transformed",xlab="Bisphenol A")
+svyhist(~log(URXTRS + 1), design=obj_cleaned, main="Triclosan concentration, log transformed",xlab="Triclosan")
+svyhist(~log(URXMHH + 1), design=obj_cleaned, main="MEHP concentration, log transformed",xlab="MEHP")
+svyhist(~log(URXMPB + 1), design=obj_cleaned, main="MPB concentration, log transformed",xlab="MPB")
+par(mfrow = c(1, 1))
+```
+
+
+
+```{r}
+
+par(mfrow = c(2, 2))
+svyhist(~log(LBXEST + 1), design=obj_cleaned, main="Estradiol hormone concentration, log transformed",xlab="Estradiol")
+svyhist(~log(LBXSHBG + 1), design=obj_cleaned, main="SHBG hormone concentration, log transformed",xlab="SHBG")
+svyhist(~log(LBXTST + 1), design=obj_cleaned, main="Testosterone hormone concentration, log transformed",xlab="Testosterone")
+par(mfrow = c(1, 1))
+```
+
+
+
+
+
+
+
+
+## PCA
+V clanku (Association between co-exposure to phenols and phthalates mixture and 
+infertility risk in women): 
+Use PCA to deal with collinearity of chemicals -> get fewer independent components. Factors with eigen values higher than 1 were determined as the main components. Z 54 chemikalii se to zmensilo na 15 main components.
+```{r}
+
+#pridat dalsi sloupce do datasetu s logtransformovanymi chemikaliemi, edc_vars obsahuje jmena sloupcu vsech chemikalii v datasetu
+obj_cleaned$variables[, paste0("log_", edc_vars)] <-log(obj_cleaned$variables[, edc_vars] + 1)
+log_edc_vars <- paste0("log_", edc_vars) #log_edc_vars -> jmena vsech log transformovanych chemikalii
+
+#pridat i log transformovane hormony do budoucna 
+obj_cleaned$variables$log_LBXEST <- log(obj_cleaned$variables$LBXEST + 1)
+obj_cleaned$variables$log_LBXSHBG <- log(obj_cleaned$variables$LBXSHBG + 1)
+obj_cleaned$variables$log_LBXTST <- log(obj_cleaned$variables$LBXTST + 1)
+
+#potreba odstranit tuto chemikalii, jinak error: cannot rescale constant/zero column to unit variance, je to comment code (value 0 - at or above detection limit)
+del <- c( "log_URDMEPLC" )
+log_edc_vars <- setdiff(log_edc_vars,del)
+
+
+pca_w <- svyprcomp(
+  ~ as.matrix(obj_cleaned$variables[, log_edc_vars]),
+  design = obj_cleaned,
+  center = TRUE,
+  scale  = TRUE
+)
+
+summary(pca_w)
+
+
+```
+
+
+```{r}
+
+eigenvalues <- pca_w$sdev^2
+prop_var    <- eigenvalues / sum(eigenvalues)
+cum_var     <- cumsum(prop_var)
+
+pca_table <- data.frame(
+  PC = paste0("PC", seq_along(eigenvalues)),
+  Eigenvalue = eigenvalues,
+    Proportion_of_variance = prop_var,
+  Cumulative_variance = cum_var
+)
+
+pca_table
+
+```
+## Define fertility vs. infertility using only the reproductive  questionnaire answer
+For comparing chemical levels between case and control groups. Two questions from reproductive questionnaire were considered as the main indicators of fertility issues. 
+1 - YES, 2 - NO, Teoreticky v tom popisu na jejich webovkach nabizi i hodnotny pro I dont know a refused, ale z toho popisu co tma maji je nikdo nezvolil
+```{r} 
+# Infertility issue variables : RHQ074	Tried for a year to become pregnant?, RHQ076	Seen a DR b/c unable to become pregnant?
+#survey weighted correlation for binary variables -> Phi coefficient
+x <- "RHQ074"
+y <- "RHQ076"
+f <- as.formula(paste("~", paste(c(x, y), collapse = " + ")))
+vcov_mat <- svyvar(f, obj_cleaned, na.rm = TRUE)
+sd_vec <- sqrt(diag(vcov_mat))
+phi_w <- vcov_mat[1,2] / (sd_vec[1] * sd_vec[2])
+phi_w
+#number of answers that are not nan
+sum(!is.na(obj_cleaned$variables$RHQ074))
+sum(!is.na(obj_cleaned$variables$RHQ076))
+
+svyhist(~RHQ074, design = obj_cleaned,breaks = 2,col = c("lightblue","salmon"),main = "Tried for a year to become pregnant? (1 = Yes, 2 = No)")
+
+svyhist(~RHQ076, design = obj_cleaned,breaks = 2,col = c("lightblue","salmon"),main = "Seen doctor, unable to become pregnant ? (1 = Yes, 2 = No)")
+
+
+
+```
+
+
+```{r}
+#Kolik radku melo odpoved ano (Na to kolik to reprezentuje lidi by jsme asi museli pocitat s tema vahama)
+sum(obj_cleaned$variables$RHQ074 == 1, na.rm = TRUE)
+
+
+```
+## Chemical concentrations in case/control groups
+Case group (infertile) lide kteri odpovedeli ano na Tried for 12 months to become pregnant.
+Control group (fertile) odpoved Ne 
+The selection of chemicals presented in the boxplots below was based on previously published studies (references, ty co tam uz jsou v planu), which frequently focused on Bisphenol A, Triclosan, and MEHP among other compounds. The fourth phtalate choice was based on online resources.
+ 
+ z clanku (Screening for phthalates biomarkers and its potential role in
+infertility outcomes in Jordan)
+The graphs shows boxplots for four different compounds. The middle line represents the median while upper and lower box borders represent the first and third quartiles. The whiskers represent minimum and maximum value.
+The p-value below each graph is from Wilcoxon non parametric test. P-values less than 0.005 were considered significant.
+The test was performed using survey weighted Wilcoxon rank-sum test -> correct approach to account for NHANES complex sampling design.
+
+
+```{r} 
+#URXBPH - bisphenol A
+table(obj_cleaned$variables$RHQ074, useNA = "ifany")
+summary(obj_cleaned$variables$log_URXBPH)
+subset_design <- subset(obj_cleaned, !is.na(RHQ074) & !is.na(log_URXBPH))
+
+design_by_group <- svyby(
+  ~log_URXBPH, 
+  ~RHQ074, 
+  subset_design,
+  FUN = svyquantile,
+  quantiles = c(0, 0.25, 0.5, 0.75, 1),
+  na.rm = TRUE,
+  ci = FALSE,       # Turn off confidence intervals first
+  keep.var = FALSE
+)
+df_box <- design_by_group
+names(df_box) <- c("RHQ074", "min", "Q1", "median", "Q3", "max")
+df_box <- df_box %>% select(RHQ074, min, Q1, median, Q3, max)
+
+ggplot(df_box, aes(x = factor(RHQ074), fill = factor(RHQ074))) +
+  geom_boxplot(
+    aes(
+      ymin = min,
+      lower = Q1,
+      middle = median,
+      upper = Q3,
+      ymax = max
+    ),
+    stat = "identity"
+  ) +
+  scale_fill_manual(values = c("lightblue", "lightgreen")) +
+  ylab("Bisphenol A concentration") +
+  xlab("1 = case (infertile), 2 = control") +
+  ggtitle("Weighted boxplot for case and control difference in log transformed Bisphenol A concentration") +
+  theme_minimal()
+
+
+```
+```{r}
+#Wilcoxon test
+subset_design <- subset(
+  obj_cleaned,
+  !is.na(log_URXBPH) & !is.na(RHQ074)
+)
+
+wt <- svyranktest(
+  log_URXBPH ~ factor(RHQ074),
+  design = subset_design,
+  test = "wilcoxon"
+)
+cat("Wilcoxon p-value:", signif(wt$p.value, 3), "\n")
+
+```
+
+```{r}
+#URXTRS - triclosan
+table(obj_cleaned$variables$RHQ074, useNA = "ifany")
+summary(obj_cleaned$variables$log_URXTRS)
+subset_design <- subset(obj_cleaned, !is.na(RHQ074) & !is.na(log_URXTRS))
+
+design_by_group <- svyby(
+  ~log_URXTRS, 
+  ~RHQ074, 
+  subset_design,
+  FUN = svyquantile,
+  quantiles = c(0, 0.25, 0.5, 0.75, 1),
+  na.rm = TRUE,
+  ci = FALSE,       # Turn off confidence intervals first
+  keep.var = FALSE
+)
+df_box <- design_by_group
+names(df_box) <- c("RHQ074", "min", "Q1", "median", "Q3", "max")
+df_box <- df_box %>% select(RHQ074, min, Q1, median, Q3, max)
+
+ggplot(df_box, aes(x = factor(RHQ074), fill = factor(RHQ074))) +
+  geom_boxplot(
+    aes(
+      ymin = min,
+      lower = Q1,
+      middle = median,
+      upper = Q3,
+      ymax = max
+    ),
+    stat = "identity"
+  ) +
+  scale_fill_manual(values = c("lightblue", "lightgreen")) +
+  ylab("Triclosan concentration") +
+  xlab("1 = case (infertile), 2 = control") +
+  ggtitle("Weighted boxplot for case and control difference in log transformed Triclosan concentration") +
+  theme_minimal()
+```
+```{r}
+#Wilcoxon test
+subset_design <- subset(
+  obj_cleaned,
+  !is.na(log_URXTRS) & !is.na(RHQ074)
+)
+
+wt <- svyranktest(
+  log_URXTRS ~ factor(RHQ074),
+  design = subset_design,
+  test = "wilcoxon"
+)
+cat("Wilcoxon p-value:", signif(wt$p.value, 3), "\n")
+
+```
+
+
+```{r}
+#URXMHH - MEHP
+table(obj_cleaned$variables$RHQ074, useNA = "ifany")
+summary(obj_cleaned$variables$log_URXMHH)
+subset_design <- subset(obj_cleaned, !is.na(RHQ074) & !is.na(log_URXMHH))
+
+design_by_group <- svyby(
+  ~log_URXMHH, 
+  ~RHQ074, 
+  subset_design,
+  FUN = svyquantile,
+  quantiles = c(0, 0.25, 0.5, 0.75, 1),
+  na.rm = TRUE,
+  ci = FALSE,       # Turn off confidence intervals first
+  keep.var = FALSE
+)
+df_box <- design_by_group
+names(df_box) <- c("RHQ074", "min", "Q1", "median", "Q3", "max")
+df_box <- df_box %>% select(RHQ074, min, Q1, median, Q3, max)
+
+ggplot(df_box, aes(x = factor(RHQ074), fill = factor(RHQ074))) +
+  geom_boxplot(
+    aes(
+      ymin = min,
+      lower = Q1,
+      middle = median,
+      upper = Q3,
+      ymax = max
+    ),
+    stat = "identity"
+  ) +
+  scale_fill_manual(values = c("lightblue", "lightgreen")) +
+  ylab("MEHP concentration") +
+  xlab("1 = case (infertile), 2 = control") +
+  ggtitle("Weighted boxplot for case and control difference in log transformed MEHP concentration") +
+  theme_minimal()
+
+```
+```{r}
+#Wilcoxon test
+subset_design <- subset(
+  obj_cleaned,
+  !is.na(log_URXMHH) & !is.na(RHQ074)
+)
+
+wt <- svyranktest(
+  log_URXMHH ~ factor(RHQ074),
+  design = subset_design,
+  test = "wilcoxon"
+)
+cat("Wilcoxon p-value:", signif(wt$p.value, 3), "\n")
+
+```
+
+
+
+
+```{r}
+
+#URXMPB - monobytyl phtalate
+table(obj_cleaned$variables$RHQ074, useNA = "ifany")
+summary(obj_cleaned$variables$log_URXMPB)
+subset_design <- subset(obj_cleaned, !is.na(RHQ074) & !is.na(log_URXMPB))
+
+design_by_group <- svyby(
+  ~log_URXMPB, 
+  ~RHQ074, 
+  subset_design,
+  FUN = svyquantile,
+  quantiles = c(0, 0.25, 0.5, 0.75, 1),
+  na.rm = TRUE,
+  ci = FALSE,       # Turn off confidence intervals first
+  keep.var = FALSE
+)
+df_box <- design_by_group
+names(df_box) <- c("RHQ074", "min", "Q1", "median", "Q3", "max")
+df_box <- df_box %>% select(RHQ074, min, Q1, median, Q3, max)
+
+ggplot(df_box, aes(x = factor(RHQ074), fill = factor(RHQ074))) +
+  geom_boxplot(
+    aes(
+      ymin = min,
+      lower = Q1,
+      middle = median,
+      upper = Q3,
+      ymax = max
+    ),
+    stat = "identity"
+  ) +
+  scale_fill_manual(values = c("lightblue", "lightgreen")) +
+  ylab("MEHP concentration") +
+  xlab("1 = case (infertile), 2 = control") +
+  ggtitle("Weighted boxplot for case and control difference in log transformed MPB concentration") +
+  theme_minimal()
+```
+```{r}
+#Wilcoxon test
+subset_design <- subset(
+  obj_cleaned,
+  !is.na(log_URXMPB) & !is.na(RHQ074)
+)
+
+wt <- svyranktest(
+  log_URXMPB ~ factor(RHQ074),
+  design = subset_design,
+  test = "wilcoxon"
+)
+cat("Wilcoxon p-value:", signif(wt$p.value, 3), "\n")
+
+```
+
+
+## Compare fertility vs. infertility with hormone levels
+```{r}
+table(obj_cleaned$variables$RHQ074, useNA = "ifany")
+summary(obj_cleaned$variables$log_LBXEST)
+subset_design <- subset(obj_cleaned, !is.na(RHQ074) & !is.na(log_LBXEST))
+
+design_by_group <- svyby(
+  ~log_LBXEST, 
+  ~RHQ074, 
+  subset_design,
+  FUN = svyquantile,
+  quantiles = c(0, 0.25, 0.5, 0.75, 1),
+  na.rm = TRUE,
+  ci = FALSE,       # Turn off confidence intervals first
+  keep.var = FALSE
+)
+df_box <- design_by_group
+names(df_box) <- c("RHQ074", "min", "Q1", "median", "Q3", "max")
+df_box <- df_box %>% select(RHQ074, min, Q1, median, Q3, max)
+
+ggplot(df_box, aes(x = factor(RHQ074), fill = factor(RHQ074))) +
+  geom_boxplot(
+    aes(
+      ymin = min,
+      lower = Q1,
+      middle = median,
+      upper = Q3,
+      ymax = max
+    ),
+    stat = "identity"
+  ) +
+  scale_fill_manual(values = c("#F0E442", "#009E73")) +
+  ylab("Estradiol concentration") +
+  xlab("1 = case (infertile), 2 = control") +
+  ggtitle("Weighted boxplot for case and control difference in log transformed Estradiol hormone concentration") +
+  theme_minimal()
+
+```
+```{r}
+#Wilcoxon test
+subset_design <- subset(
+  obj_cleaned,
+  !is.na(log_LBXEST) & !is.na(RHQ074)
+)
+
+wt <- svyranktest(
+  log_LBXEST ~ factor(RHQ074),
+  design = subset_design,
+  test = "wilcoxon"
+)
+cat("Wilcoxon p-value:", signif(wt$p.value, 3), "\n")
+
+```
+
+
+```{r}
+table(obj_cleaned$variables$RHQ074, useNA = "ifany")
+summary(obj_cleaned$variables$log_LBXSHBG)
+subset_design <- subset(obj_cleaned, !is.na(RHQ074) & !is.na(log_LBXSHBG))
+
+design_by_group <- svyby(
+  ~log_LBXSHBG, 
+  ~RHQ074, 
+  subset_design,
+  FUN = svyquantile,
+  quantiles = c(0, 0.25, 0.5, 0.75, 1),
+  na.rm = TRUE,
+  ci = FALSE,       # Turn off confidence intervals first
+  keep.var = FALSE
+)
+df_box <- design_by_group
+names(df_box) <- c("RHQ074", "min", "Q1", "median", "Q3", "max")
+df_box <- df_box %>% select(RHQ074, min, Q1, median, Q3, max)
+
+ggplot(df_box, aes(x = factor(RHQ074), fill = factor(RHQ074))) +
+  geom_boxplot(
+    aes(
+      ymin = min,
+      lower = Q1,
+      middle = median,
+      upper = Q3,
+      ymax = max
+    ),
+    stat = "identity"
+  ) +
+  scale_fill_manual(values = c("#F0E442", "#009E73")) +
+  ylab("SHBG concentration") +
+  xlab("1 = case (infertile), 2 = control") +
+  ggtitle("Weighted boxplot for case and control difference in log transformed SHBG hormone concentration") +
+  theme_minimal()
+
+```
+```{r}
+#Wilcoxon test
+subset_design <- subset(
+  obj_cleaned,
+  !is.na(log_LBXSHBG) & !is.na(RHQ074)
+)
+
+wt <- svyranktest(
+  log_LBXSHBG ~ factor(RHQ074),
+  design = subset_design,
+  test = "wilcoxon"
+)
+cat("Wilcoxon p-value:", signif(wt$p.value, 3), "\n")
+```
+
+
+
+```{r}
+table(obj_cleaned$variables$RHQ074, useNA = "ifany")
+summary(obj_cleaned$variables$log_LBXTST)
+subset_design <- subset(obj_cleaned, !is.na(RHQ074) & !is.na(log_LBXTST))
+
+design_by_group <- svyby(
+  ~log_LBXTST, 
+  ~RHQ074, 
+  subset_design,
+  FUN = svyquantile,
+  quantiles = c(0, 0.25, 0.5, 0.75, 1),
+  na.rm = TRUE,
+  ci = FALSE,       # Turn off confidence intervals first
+  keep.var = FALSE
+)
+df_box <- design_by_group
+names(df_box) <- c("RHQ074", "min", "Q1", "median", "Q3", "max")
+df_box <- df_box %>% select(RHQ074, min, Q1, median, Q3, max)
+
+ggplot(df_box, aes(x = factor(RHQ074), fill = factor(RHQ074))) +
+  geom_boxplot(
+    aes(
+      ymin = min,
+      lower = Q1,
+      middle = median,
+      upper = Q3,
+      ymax = max
+    ),
+    stat = "identity"
+  ) +
+  scale_fill_manual(values = c("#F0E442", "#009E73")) +
+  ylab("testosterone concentration") +
+  xlab("1 = case (infertile), 2 = control") +
+  ggtitle("Weighted boxplot for case and control difference in log transformed testosterone hormone concentration") +
+  theme_minimal()
+
+```
+
+```{r}
+#Wilcoxon test
+subset_design <- subset(
+  obj_cleaned,
+  !is.na(log_LBXTST) & !is.na(RHQ074)
+)
+
+wt <- svyranktest(
+  log_LBXTST ~ factor(RHQ074),
+  design = subset_design,
+  test = "wilcoxon"
+)
+cat("Wilcoxon p-value:", signif(wt$p.value, 3), "\n")
+
+```
+
+```{r}
+colnames(obj_cleaned)
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
