@@ -1,0 +1,448 @@
+---
+title: "playground"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+library(knitr)
+library(haven)
+library(dplyr)
+library(car)
+library(survey)
+library(srvyr)
+```
+
+## Read datasets
+
+```{r}
+#Nacist data a z nekterych vybrat jen nektere promenne
+
+#Demographics, RIDAGEYR - vek, RIDEXPRG - pregnant, DMDEDUC2 - education level, RIAGENDR - gender, INDFMPIR - ratio of family income to poverty 
+#RIDSTATR - both interview and MEC examination (2 - both, 1 - only interview)
+demo_data = read_xpt("./data/DEMO_H.xpt") |> select(SEQN,RIDAGEYR,RIDEXPRG,DMDEDUC2,RIAGENDR,INDFMPIR,WTMEC2YR, SDMVPSU,SDMVSTRA)
+#Reproductive health data, RHQ031 - had regular periods in past 12 months, RHQ074 - tried for a yer to become pregnant, RHQ076 - seen DR unable to become pregnant, RHQ131 - ever been pregnant, 
+#RHQ160 - how many times have been pregnant, RHQ171 - live birth deliveries, RHD280 - had a hysterectomy, RHQ078 - pelvic infection,RHD180 - age at firts livebirth
+rhq_data = read_xpt("./data/RHQ_H.xpt") |> select(SEQN,RHQ031,RHQ074,RHQ076, RHQ131,RHQ160, RHQ171, RHD280, RHQ078, RHD180)
+# SEx steroide hormone, LBXTST - testosterone (ng/dL), LBXEXT - estradiol(pg/mL), LBXSHGB (nmol/L), promene koncici na LC (0 - above detection limit, 1 below detection limit)
+tst_data = read_xpt("./data/TST_H.xpt")
+#Phtalates and plasticizesr metabolites
+ssphte_data = read_xpt("./data/SSPHTE_H.xpt")
+
+#Personal care and consumer product chemicals and metabolites
+ephpp_data = read_xpt("./data/EPHPP_H.xpt")
+
+#phtalates and plasticizers metabolites
+phthte_data = read_xpt("./data/PHTHTE_H.xpt")
+
+#alcohol use, ALQ120Q - How often drink alcohol over past 12 months
+alq_data = read_xpt("./data/ALQ_H.xpt") |> select(SEQN,ALQ120Q)
+#smoking cigarette use, SMQ040 - do you now smoke cigarettes, SMD650 avg cigarettes a day last month
+smq_data = read_xpt("./data/SMQ_H.xpt") |> select(SEQN,SMQ040,SMD650)
+#medical condition
+#mcq_data = read_xpt("./data/MCQ_H.xpt") |> select(SEQN,)
+#body measures, BMXBMI - body maxx index
+bmx_data = read_xpt("./data/BMX_H.xpt") |> select(SEQN,BMXBMI)
+
+
+```
+
+## Merging datasets
+
+```{r}
+#iiner join keep only rows where there is a SEQN match in both datasets
+merged_data = inner_join(demo_data, rhq_data, by = "SEQN")
+merged_data = inner_join(merged_data, tst_data, by = "SEQN")
+merged_data = inner_join(merged_data, ssphte_data, by = "SEQN")
+merged_data = inner_join(merged_data, ephpp_data, by = "SEQN")
+merged_data = inner_join(merged_data, alq_data, by = "SEQN")
+merged_data = inner_join(merged_data, smq_data, by = "SEQN")
+merged_data = inner_join(merged_data, bmx_data, by = "SEQN")
+merged_data = inner_join(merged_data, phthte_data, by = "SEQN")
+nrow(merged_data)
+#jedna promena se vyskytuje ve vice datasetech
+merged_data <- merged_data[, !grepl("\\.y$", names(merged_data))]
+names(merged_data)[names(merged_data) == "URXUCR.x"] <- "URXUCR"
+names(merged_data)[names(merged_data) == "WTSB2YR.x"] <- "WTSB2YR"
+
+var_labels <- sapply(merged_data, function(x) attr(x, "label"))
+labels_df <- data.frame(
+  variable = names(var_labels),
+  label = unname(var_labels)
+)
+print(labels_df)
+```
+
+## Remove, based on exclusion, inclusion criteria from the plan
+
+```{r}
+#age between 18 and 45 and female only, not pregnant
+clean_data <- merged_data[merged_data$RIDAGEYR >= 18 & merged_data$RIDAGEYR <= 50 & merged_data$RIAGENDR == 2 & merged_data$RIDEXPRG == 2,]
+nrow(clean_data)
+#extreme urinary creatine values
+
+clean_data <- clean_data[clean_data$URXUCR<300,]
+
+#missing key covariates -> R si NaN values odstraní automaticky pri vytvareni modelu ?
+
+#urinary chemicals measurement and MEC examination
+clean_data <- clean_data[clean_data$WTSSBH2Y>0 & clean_data$WTSB2YR>0 & clean_data$WTMEC2YR>0,]
+nrow(clean_data)
+
+#at least one detectable urinary chemical measurement (ze vsech chemikalii v EPHPP a SSPHTE)
+all_vars <- union(union(names(ssphte_data), names(ephpp_data)),names(phthte_data))
+exclude_vars <- c( "SEQN","WTSSBH2Y","WTSB2YR" )
+edc_vars <- setdiff(all_vars, exclude_vars)
+length(edc_vars)
+data_1 <- clean_data[
+  rowSums(!is.na(clean_data[, edc_vars])) >= 1, #alespon jedna hodnota ze vsech merenych chemikalii neni Nan (missing)
+]
+# at least one detectable hormone measurement (not missing - nan)
+horm_vars <- c("LBXSHBG","LBXEST","LBXTST")
+data_1 <- data_1[
+  rowSums(!is.na(data_1[, horm_vars])) >= 1, #alespon jedna hodnota ze vsech hormonu neni nan
+]
+
+nrow(data_1)
+```
+
+## Survey design object -> to work with the weights
+NHANES: You must use the weight of the smallest subpopulation that includes all the variables you want to include in your analysis.
+Z tech mensich souboru obsahují speciální vahy jenom ty chemikálie (EPHPP a SSPHTE a PHTHTE). EPHPP a PHTHTE maji stejne (WTSB2YR) a SSPHTE ma jiné (WTSSBH2Y). Nevim ktera z nich by se mela pouzit, ale nejmensi je dataset SSPHTE.
+
+```{r}
+# v ukazkach pak na vsechny upravy pouzivaji uz jenom survey desing objekt -> vytvorit z celych dat a znovu stejne profiltrovat
+data_w <- svydesign(id = ~SDMVPSU, strata= ~SDMVSTRA, weight=~WTSB2YR,   nest=TRUE, data=merged_data)
+
+obj_cleaned <- data_w |>
+  subset(
+    RIDAGEYR >= 18 &
+    RIDAGEYR <= 50 &
+    RIAGENDR == 2 &
+    RIDEXPRG == 2 &
+    URXUCR < 300 &
+    WTSSBH2Y > 0 &
+    WTSB2YR > 0 &
+    WTMEC2YR > 0 &
+    rowSums(!is.na(as.data.frame(data_w$variables[, edc_vars]))) >= 1 &
+    rowSums(!is.na(as.data.frame(data_w$variables[, horm_vars]))) >= 1
+  )
+nrow(obj_cleaned$variables)
+summary(obj_cleaned)
+#vytvoreny survey objekt porad obsahuje sloupce s vahama z vetsich datasetu -> pri vytvareni modelu upravit a nebrat je v uvahu
+```
+
+##  Variables statistics
+
+```{r}
+#age
+svymean(~RIDAGEYR,obj_cleaned,na.rm = TRUE)
+
+
+```
+```{r}
+ #visualize
+svyhist(~URXBPH, design=obj_cleaned, main="Bisphenol A concentration")
+
+svyhist(~log(URXBPH + 1), design=obj_cleaned, main="Bisphenol A concentration, log transformed")
+```
+```{r}
+#Correlation matrix - na vsem krome chemikalii, weights a gender a pregnant, protoze to jsou po filtraci vlastne konstantni sloupce pro vsechny stejne
+exclude_vars <- c("SEQN","WTMEC2YR", "WTSSBH2Y", "WTSB2YR",edc_vars,"SDMVPSU","SDMVSTRA","RIDEXPRG","RIAGENDR")
+cor_vars <- setdiff(names(obj_cleaned$variables), exclude_vars)
+length(cor_vars)
+
+cor_matrix <- cor(obj_cleaned$variables[, cor_vars],use = "pairwise.complete.obs")
+corrplot::corrplot(cor_matrix,tl.cex = 0.6,method = "color",type = "upper")
+
+
+```
+```{r}
+# multicollinearity check
+# correlation between the chemicals (exposures), phthalates and their metabolites could be significantly correlated
+phthalate_vars <- c('URXUCR', 'SSURMHBP', 'SSURHIBP', 'URXCNP', 'URXCOP', 'URXECP', 'URXMBP', 'URXMC1', 'URXMEP', 'URXMHH', 'URXMHNC', 'URXMHP', 'URXMIB', 'URXMNP', 'URXMOH', 'URXMZP')
+phenol_vars <- c('URXBP3', 'URXBPH', 'URXBPF', 'URXBPS', 'URXTLC', 'URXTRS', 'URXBUP', 'URXEPB', 'URXMPB', 'URXPPB', 'URX14D', 'URXDCB')
+
+chem_vars <- c(phthalate_vars, phenol_vars)
+
+chem_data <- obj_cleaned$variables[, chem_vars]
+cor_mat <- cor(chem_data, use = "pairwise.complete.obs")
+corrplot::corrplot(cor_mat,tl.cex = 0.6,method = "color",type = "upper")
+
+# VIF (Variance inflation factor)
+# VIF > 5: high, VIF > 10: severe multicollinearity
+
+
+```
+```{r}
+# EDC concentrations are right-skewed, before PCA log-transform the chemicals
+chem_log <- log(chem_data)
+# standardizing, scaling
+chem_scaled <- scale(chem_log)
+
+pca_res <- prcomp(chem_scaled, center = TRUE, scale. = TRUE)
+summary(pca_res) # explained variance - how many PCs to keep?
+
+# how many PCs to keep? (practical rules)
+# 1.) scree plot ("elbow rule") most common
+# look for clear elbow, keep PCs before the curve flattens
+plot(pca_res, type = "l")
+
+# 2.) variance threshold - common threshold ~ 50-70% cummulative variance
+model <- svyglm(
+  log(LBXTST) ~ URXECP + URXMHH + URXCOP + URXMNP + RIDAGEYR + BMXBMI, # gender doesn't make sense, we have just women
+  design = obj_cleaned
+)
+vif_values <- vif(model)
+
+# View the results
+print(vif_values)
+
+```
+
+```{r}
+loadings <- pca_res$rotation
+print(loadings)
+```
+
+
+
+```{r}
+
+# typically: PC1 = overall exposure burden, PC2 = different metabolite patterns
+# add PCA scores back to your survey object
+pc_scores <- as.data.frame(pca_res$x[, 1:2])  # first 2 PCs
+colnames(pc_scores) <- c("PC1", "PC2")
+obj_cleaned$variables <- cbind(obj_cleaned$variables, pc_scores)
+# PC1 and PC2 can be used as exposure variables 
+```
+
+```{r}
+obj_cleaned$variables$SMQ040
+
+```
+
+
+```{r}
+# survey weighted regression using PCA scores
+# testosterone
+# factor() - category, not a number
+obj_cleaned <- update(obj_cleaned, 
+                      SMOKE_STATUS = factor(SMQ040, 
+                                            levels = c(3, 2, 1), 
+                                            labels = c("Never", "Some_Days", "Every_Day")))
+
+model <- svyglm(
+  log(LBXTST) ~ PC1 + RIDAGEYR + SMOKE_STATUS, # handle SMQ040
+  design = obj_cleaned
+)
+
+summary(model)
+# checking the assumptions
+# multicollinearity - ok (PCA)
+# normality of residuals - ok
+qqnorm(residuals(model))
+qqline(residuals(model))
+# heteroscedasticity - formal tests (like Breusch-Pagan) are not appropriate for survey models
+# svyglm() uses robust standard errors - mild heteroscedasticity is acceptable
+# roughly symmetric around zero, no clear patterns
+# also linearity check?
+plot(fitted(model), residuals(model))
+# data distribution, outliers
+boxplot(log(obj_cleaned$variables$LBXTST))
+x <- log(obj_cleaned$variables$LBXTST) # outliers flagged by the boxplot rule (> Q3 + 1.5×IQR or < Q1 − 1.5×IQR)
+
+bp <- boxplot.stats(x)
+bp$out
+exp(bp$out)
+
+confint(model)
+
+r_dev <- residuals(model, type = "deviance")
+plot(fitted(model), r_dev) # linear structure, we want no pattern or curvature
+abline(h = 0, lty = 2)
+
+# normality of the error distribution is not required for consistency
+qqnorm(r_dev)
+qqline(r_dev) # mild tail deviations are ok
+
+nrow(model$model)
+
+```
+```{r}
+library(splines)
+# estradiol
+model <- svyglm(
+  log(LBXEST) ~ PC1 + RIDAGEYR + BMXBMI,
+  design = obj_cleaned
+)
+
+summary(model)
+confint(model)
+
+r_dev <- residuals(model, type = "deviance")
+plot(fitted(model), r_dev) # linear structure, we want no pattern or curvature
+abline(h = 0, lty = 2)
+
+# normality of the error distribution is not required for consistency
+qqnorm(r_dev)
+qqline(r_dev) # mild tail deviations are ok
+
+# heteroscedasticity - the weights should deal with that
+plot(fitted(model), abs(r_dev))
+
+boxplot(log(obj_cleaned$variables$LBXEST))
+x <- log(obj_cleaned$variables$LBXEST)
+
+bp <- boxplot.stats(x)
+bp$out
+exp(bp$out)
+
+influence <- influence(model)
+summary(influence$hat) # leverage
+summary(influence$cooks) # influence
+
+# weight distribution
+hist(weights(model), breaks = 50)
+summary(weights(model))
+
+# multicollinearity
+vif(model)
+
+nrow(model$model)
+
+
+```
+```{r}
+model1 <- svyglm(log(LBXEST) ~ PC1 + RIDAGEYR + BMXBMI, design = obj_cleaned)
+model2 <- svyglm(log(LBXEST) ~ PC1 + ns(RIDAGEYR,3) + BMXBMI, design = obj_cleaned)
+model3 <- svyglm(log(LBXEST) ~ PC1 + RIDAGEYR + ns(BMXBMI,3), design = obj_cleaned)
+
+summary(model1)
+confint(model1)
+summary(model2)
+confint(model2)
+summary(model3)
+confint(model3)
+```
+
+```{r}
+# level of education DMDEDUC2
+# 1 ... less than 9th grade
+# 2 ... 9-11th grade
+# 3 ... high school graduate/GED or equivalent
+# 4 ... some college or AA degree
+# 5 ... college graduate or above
+# 7 ... refused
+
+obj_cleaned$variables$DMDEDUC2
+```
+
+```{r}
+# alcohol consumption
+# ALQ120Q: How often drink alcohol over past 12 months?, range 0 to 365
+
+obj_cleaned$variables$ALQ120Q
+# no 777 or 999 ... no need to handle it
+
+```
+
+```{r}
+# ratio of family income to poverty INDFMPIR
+# continuous, 0 to 5
+
+obj_cleaned$variables$INDFMPIR
+```
+
+```{r}
+# ratio of family income to poverty INDFMPIR
+# continuous, 0 to 5
+
+obj_cleaned$variables$SM
+```
+
+
+
+```{r}
+
+# SHBG
+# age, bmi, smoking, alcohol, education, income
+# strongest predictor should be BMI, well-known strong inverse relationship between BMI and SHBG
+# alcohol consumption often increases SHBG levels
+obj_cleaned <- update(obj_cleaned, 
+    # 1. Education as a Factor
+    # We filter out 7 (Refused) and 9 (Don't Know) to keep the analysis clean
+    EDUCATION_LEVEL = factor(ifelse(DMDEDUC2 <= 5, DMDEDUC2, NA),
+                        levels = c(1, 2, 3, 4, 5),
+                        labels = c("Less_than_9th", "9-11th", "HS_Grad", "Some_College", "College_Grad")))
+    
+# how to decide on the confounders?
+# -> look at the coeffiecient of my main predictors (here BMI and PC1)
+# if dropping a variable changes those coefficients by less than 10%, the variable is likely not a confounder
+# gain in statistical power - we are increasing our sample size
+
+
+model <- svyglm(
+  #log(LBXSHBG) ~ PC1 + RIDAGEYR + BMXBMI + SMOKE_STATUS + ALQ120Q + EDUCATION_LEVEL + INDFMPIR,
+  #log(LBXSHBG) ~ PC1 + RIDAGEYR + BMXBMI + SMOKE_STATUS + EDUCATION_LEVEL + INDFMPIR,
+  #log(LBXSHBG) ~ PC1 + RIDAGEYR + BMXBMI + EDUCATION_LEVEL + ALQ120Q + INDFMPIR,
+  log(LBXSHBG) ~ PC1 + RIDAGEYR + BMXBMI + EDUCATION_LEVEL + INDFMPIR,
+  design = obj_cleaned
+)
+
+summary(model)
+confint(model)  # doesn't work here, probably because the model is too sparse, big part of the data got dropped due to NaN values
+
+r_dev <- residuals(model, type = "deviance")
+plot(fitted(model), r_dev) # linear structure, we want no pattern or curvature
+abline(h = 0, lty = 2)
+
+# normality of the error distribution is not required for consistency
+qqnorm(r_dev)
+qqline(r_dev) # mild tail deviations are ok
+
+boxplot(log(obj_cleaned$variables$LBXSHBG))
+x <- log(obj_cleaned$variables$LBXSHBG)
+
+bp <- boxplot.stats(x)
+bp$out
+exp(bp$out)
+
+# multicollinearity
+check_vif <- lm(log(LBXSHBG) ~ PC1 + RIDAGEYR + BMXBMI + SMOKE_STATUS + ALQ120Q + EDUCATION_LEVEL + INDFMPIR, 
+                data = obj_cleaned$variables)
+vif(check_vif)
+
+nrow(model$model) # only 71 observations x 324 (a lot gets dropped due to NaN values)
+
+```
+
+```{r}
+# what has the most NA values
+variables_to_check <- c("LBXSHBG", "PC1", "RIDAGEYR", "BMXBMI", 
+                        "SMQ040", "ALQ120Q", "DMDEDUC2", "INDFMPIR")
+
+sapply(obj_cleaned$variables[variables_to_check], function(x) sum(is.na(x)))
+```
+
+
+```{r}
+# sanity check
+apply(chem_scaled, 2, mean) # should be ~0
+apply(chem_scaled, 2, sd) # should be ~1
+```
+
+
+
+
+```{r}
+
+
+
+```
+
+
